@@ -160,6 +160,7 @@ drops:   unknown_peer / auth_or_invalid / spoof / no_route …
 
 - 📘 [**部署指南**](docs/deployment.md)——「一个 Hub + 两个 Spoke」生产演练：密钥管理、主机网络、升级、HA/故障切换、密钥轮换、监控。
 - 📐 [**线路协议规范**](docs/PROTOCOL.md)——规范化的 v1 链路协议（用于互操作与审阅）。
+- 🎛 [**控制面协议**](docs/CONTROL-PROTOCOL.md)——管理/监控运行中守护进程的本地 UDS API，任意语言可直接对接（无需 FFI）。
 - 🍏 [**macOS Spoke runbook**](docs/macos-spoke-acceptance.md) · 🛰 [**RouterOS 容器指南**](docs/routeros-container.md)
 - 🏗 [**设计与架构**](docs/subnetra-develop.md)——产品需求与系统设计。
 - 📦 [**发布页**](https://github.com/jamiesun/subnetra/releases/latest) · 🐳 [**容器镜像**](https://github.com/jamiesun/subnetra/pkgs/container/subnetra) · ⚙️ [**示例配置**](config.example.json)
