@@ -172,6 +172,7 @@ taxonomy, and alerting examples.
 
 - 📘 [**Deployment guide**](docs/deployment.md) — hub + two-spoke production walkthrough: secrets, host networking, upgrades, HA/failover, key rotation, monitoring.
 - 📐 [**Wire-protocol spec**](docs/PROTOCOL.md) — the normative v1 on-wire contract (for interoperability and review).
+- 🎛 [**Control-plane protocol**](docs/CONTROL-PROTOCOL.md) — the local UDS API to manage/monitor a running daemon from any language (no FFI).
 - 🍏 [**macOS spoke runbook**](docs/macos-spoke-acceptance.md) · 🛰 [**RouterOS container guide**](docs/routeros-container.md)
 - 🏗 [**Design & architecture**](docs/subnetra-develop.md) — the PRD and system design.
 - 📦 [**Releases**](https://github.com/jamiesun/subnetra/releases/latest) · 🐳 [**Container image**](https://github.com/jamiesun/subnetra/pkgs/container/subnetra) · ⚙️ [**Example config**](config.example.json)
