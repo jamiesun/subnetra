@@ -271,7 +271,7 @@ subnetra status --json | jq .
 ```jsonc
 {
   "schema_version": 1,                 // bumped only on a breaking schema change
-  "version": "0.5.1",
+  "version": "0.9.0",
   "mode": "raw_direct",
   "local_id": 1,
   "listen_port": 18020,
@@ -297,8 +297,10 @@ subnetra status --json | jq .
   `key_id`, and peer matching stay keyed on the numeric `id`) — and is bounded to
   printable ASCII so it is safe to echo in `subnetra status`. Omitted → empty
   string in JSON and id-only in the human view (unchanged from before).
-  ~90 s — long enough to tolerate a few missed keepalives (§7) without flapping.
-  Use it (or `last_seen_age_seconds`) for a per-peer health/heartbeat alert.
+- `peers[].online` is `true` when the peer's last authenticated packet is within
+  the freshness window of ~90 s — long enough to tolerate a few missed keepalives
+  (§7) without flapping. Use it (or `last_seen_age_seconds`) for a per-peer
+  health/heartbeat alert.
 - `counters` carries **every** counter from the human view (traffic + the full
   drop taxonomy), so a scrape never misses a field — it is the source for the
   Prometheus textfile exporter below.

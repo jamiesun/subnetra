@@ -139,7 +139,7 @@ validate a config offline.
 you can tell *why* traffic is or isn't flowing:
 
 ```text
-subnetra v0.5.1 [running]
+subnetra v0.9.0 [running]
 mode=raw_direct local_id=1 udp_port=18020 tun=snr0 peers=2
 peers:
   id=2 name=bj-office-gw endpoint=203.0.113.2:18020 allowed_src=10.0.0.2/32

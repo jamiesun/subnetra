@@ -110,8 +110,9 @@ and do not delete the v2 reservation points.
   **English**. The Chinese files are: `docs/subnetra-develop.md` (the design doc)
   and `docs/AGENT.zh-CN.md` (the mirror of this file). Do not translate the design
   doc; do keep the mirror in sync.
-- **Keep the status honest.** The development-status table in `README.md` reflects
-  real progress. Update it truthfully as tasks land — never mark a stub as done.
+- **Keep the status honest.** Any progress or capability described in `README.md`,
+  the docs, or the `--help` / `status` output must reflect real, shipped behavior —
+  never present a stub, a reserved (v2) interface, or a planned feature as done.
 - **Verify before claiming done.** Build, run `zig build test`, and confirm the
   binary still links statically and stays under the size budget before declaring a
   task complete.
