@@ -180,7 +180,7 @@ expects and treat an unknown bump as "re-check the schema."
 ```jsonc
 {
   "schema_version": 1,              // u32 — bump only on a breaking change
-  "version": "0.6.0",              // daemon build version
+  "version": "0.9.0",              // daemon build version
   "mode": "raw_direct",            // egress mode (v1: always "raw_direct")
   "local_id": 1,                    // u32 — this node's id
   "listen_port": 18020,             // u16 — primary UDP listen port
