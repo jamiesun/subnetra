@@ -241,7 +241,7 @@ subnetra status --json | jq .
 ```jsonc
 {
   "schema_version": 1,                 // 仅在 schema 发生破坏性变更时递增
-  "version": "0.5.1",
+  "version": "0.9.0",
   "mode": "raw_direct",
   "local_id": 1,
   "listen_port": 18020,
@@ -250,6 +250,7 @@ subnetra status --json | jq .
     {
       "id": 2,
       "endpoint": "203.0.113.7:51822",
+      "name": "bj-office-gw",               // 可选的运维标签（未设置时为 ""）
       "allowed_src": "10.66.0.2/32",
       "last_seen_wall_ns": 1700000095000000000,
       "last_seen_age_seconds": 5,      // 若该 peer 从未认证过则为 null
@@ -260,6 +261,11 @@ subnetra status --json | jq .
 }
 ```
 
+- `peers[].name` 是一个**可选**的人类可读标签（如 `bj-office-gw`、`colo-hub`），
+  在 `config.json` 里逐 peer 设置（`peers[].name`）。它**仅是元数据**——绝不参与
+  身份/认证/路由（密钥派生、线缆 `key_id`、peer 匹配都仍以数字 `id` 为准）——且限定为
+  可打印 ASCII，因此在 `subnetra status` 中回显是安全的。省略时 JSON 为空字符串、
+  文本视图仅显示 id（与之前一致）。
 - `peers[].online` 在该 peer 最近一次已认证报文落在 ~90s 之内时为 `true`——足以容忍几次漏掉的保活（§7）
   而不抖动。用它（或 `last_seen_age_seconds`）做逐 peer 的健康/心跳告警。
 - `counters` 承载文本视图里的**每一个**计数器（流量 + 完整的丢包分类），所以抓取不会漏掉任何字段——
