@@ -2,7 +2,7 @@
 //!
 //! Measures the per-packet cost of subnetra's data-plane forwarding decision
 //! *around* the AEAD, using the LIVE reactor/policy/peer primitives with NO
-//! network I/O (no tun fd, no udp fd, no syscalls). Two pipelines are timed:
+//! network I/O (no tun fd, no udp fd, no syscalls). Three measurements are made:
 //!
 //!   tx-forward (egress, `pumpTunToUdp` hot path):
 //!     ipv4Dst -> PolicyTree.match -> PeerRegistry.findById -> encodeEgress(seal)
@@ -11,11 +11,21 @@
 //!     parseKeyId -> findById -> decodeIngress(open+replay) -> ipv4Src ->
 //!     allowed_src.contains -> ipv4Dst -> PolicyTree.match
 //!
-//! Each pipeline's number is also printed against the raw AEAD floor measured in
-//! the same run (seal for tx, open for rx) so the "forwarding tax" — the parse +
+//!   ingress-select (obfuscation de-mux, `selectIngressPeer`):
+//!     with header obfuscation ON (the default) the wire key_id is masked, so the
+//!     reactor cannot index a peer directly — it trials every configured peer's
+//!     rx link key via a keyed-Blake2b `tryDeobfuscate` until one recovers a
+//!     self-consistent header. A junk datagram NO peer claims pays the FULL
+//!     peer-count sweep before it is silently dropped; measured against the
+//!     cleartext key_id selector (obfuscation off) to expose the per-peer de-mux
+//!     cost that scales with the configured peer count.
+//!
+//! The tx/rx pipeline numbers are also printed against the raw AEAD floor measured
+//! in the same run (seal for tx, open for rx) so the "forwarding tax" — the parse +
 //! route + registry-lookup overhead the daemon pays on top of crypto — is
-//! visible directly. crypto-bench (issue #66) measures the AEAD floor in
-//! isolation; this tool measures what the daemon actually executes per packet.
+//! visible directly, and the ingress-select number against the cleartext selector
+//! for the obfuscation de-mux tax. crypto-bench (issue #66) measures the AEAD floor
+//! in isolation; this tool measures what the daemon actually executes per packet.
 //!
 //! NOT part of the shipped daemon (built via `zig build tool:forward-bench`).
 
@@ -46,14 +56,17 @@ const IP_SPOKE: u32 = 0x0A42_0002; // 10.66.0.2  (inner src of the relayed packe
 const IP_DEST: u32 = 0x0A42_0003; //  10.66.0.3  (inner dst -> routes to peer 3)
 
 const USAGE =
-    \\Usage: forward-bench [--size BYTES] [--iters N]
+    \\Usage: forward-bench [--size BYTES] [--iters N] [--peers N]
     \\
     \\Microbenchmark subnetra's in-process forwarding hot path (parse + route +
-    \\registry lookup + codec) with no network I/O. Reports tx/rx packet rate and
-    \\the forwarding tax over the raw AEAD floor measured in the same run.
+    \\registry lookup + codec) with no network I/O. Reports tx/rx packet rate, the
+    \\forwarding tax over the raw AEAD floor, and the ingress peer-selection cost of
+    \\header obfuscation (the per-peer de-mux sweep), all measured in the same run.
     \\
     \\  --size BYTES   inner IPv4 packet size per op (default 1400, 20..1452)
     \\  --iters N      iterations per measurement (default 200000)
+    \\  --peers N      peers for the ingress-select sweep (default/max the build's
+    \\                 MAX_PEERS; rebuild with -Dmax-peers=128 to sweep higher)
     \\  -h, --help     show this help
     \\  -V, --version  show version
     \\
@@ -117,6 +130,53 @@ fn buildFixture(fx: *Fixture, psk: crypto.Key) !void {
     };
 }
 
+/// Populate `reg` (local id 1) with `npeers` spoke peers — ids 2..npeers+1, each
+/// with a distinct /32 `allowed_src` and UDP endpoint derived from its id — so the
+/// ingress-select benchmark can measure how peer selection scales with the peer
+/// count. Runs once at fixture-build time, so per-peer string formatting is fine.
+fn buildWideRegistry(reg: *peer.PeerRegistry, psk: crypto.Key, npeers: usize) !void {
+    reg.* = peer.PeerRegistry.init(1);
+    var id: u32 = 2;
+    while (id < 2 + npeers) : (id += 1) {
+        var ebuf: [32]u8 = undefined;
+        var cbuf: [32]u8 = undefined;
+        const hi = (id >> 8) & 0xff;
+        const lo = id & 0xff;
+        const ep_str = try std.fmt.bufPrint(&ebuf, "10.66.{d}.{d}:51820", .{ hi, lo });
+        const src_str = try std.fmt.bufPrint(&cbuf, "10.66.{d}.{d}/32", .{ hi, lo });
+        _ = try reg.add(psk, id, try config.parseEndpoint(ep_str), try config.parseCidr(src_str), EPOCH);
+    }
+}
+
+/// Mirror of the reactor's obfuscation-ON ingress selection (`selectIngressPeer`):
+/// trial-de-obfuscate `wire` against every peer's rx link key, returning the first
+/// whose keyed-Blake2b pad recovers a self-consistent header (de-masking `wire` IN
+/// PLACE on the hit) or null if none claim it. This is the O(peers) keyed-hash
+/// sweep the daemon runs per inbound datagram when header obfuscation is on.
+fn selectTrial(reg: *peer.PeerRegistry, wire: []u8) ?*peer.Peer {
+    var i: usize = 0;
+    while (i < reg.len) : (i += 1) {
+        const p = &reg.peers[i];
+        if (reactor.tryDeobfuscate(p.rx.link_key, p.id, wire)) return p;
+    }
+    return null;
+}
+
+/// Fill `buf[0..len]` with a deterministic junk datagram that NO peer in `reg`
+/// claims — the worst case for `selectTrial`, which must sweep every peer before
+/// the datagram is silently dropped. A miss leaves `buf` untouched (tryDeobfuscate
+/// only de-masks on a hit), so the bytes stay stable across bench iterations. No
+/// PRNG: a counter is folded into the fill and retried until the sweep misses,
+/// which it does on the first try for any header not forgeable without a link key.
+fn craftJunkMiss(buf: []u8, len: usize, reg: *peer.PeerRegistry) void {
+    var seed: usize = 0;
+    while (true) : (seed += 1) {
+        var i: usize = 0;
+        while (i < len) : (i += 1) buf[i] = @intCast((i *% 131 +% seed) & 0xff);
+        if (selectTrial(reg, buf[0..len]) == null) return;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = init.minimal.args;
@@ -152,6 +212,18 @@ pub fn main(init: std.process.Init) !void {
             writeErr(io, "forward-bench: --iters must be >= 1\n");
             return error.InvalidArgument;
         }
+    }
+
+    // Peers configured for the ingress-select sweep. Defaults to (and is capped
+    // at) this build's MAX_PEERS; to sweep past it, rebuild with -Dmax-peers=N.
+    var npeers: usize = config.MAX_PEERS;
+    if (flagValue(args, "--peers")) |raw| {
+        npeers = std.fmt.parseInt(usize, raw, 10) catch {
+            writeErr(io, "forward-bench: invalid --peers value\n");
+            return error.InvalidArgument;
+        };
+        if (npeers < 1) npeers = 1;
+        if (npeers > config.MAX_PEERS) npeers = config.MAX_PEERS;
     }
 
     const psk: crypto.Key = [_]u8{0x42} ** crypto.KEY_LEN;
@@ -274,6 +346,90 @@ pub fn main(init: std.process.Init) !void {
     writeOut(io, std.fmt.bufPrint(&sbuf, "  rx forwarding tax: {d:.1} ns/op over AEAD open ({d:.1} -> {d:.1} ns/op)\n", .{
         rx_ns - open_ns, open_ns, rx_ns,
     }) catch "");
+
+    // --- ingress peer-selection: the header-obfuscation de-mux sweep ---
+    // With obfuscation ON (default) the wire key_id is masked, so the reactor
+    // cannot index a peer directly: `selectIngressPeer` trials every configured
+    // peer's rx link key via a keyed-Blake2b `tryDeobfuscate` until one recovers a
+    // self-consistent header. A genuine datagram hits after up to N trials (the
+    // sender's registry position); a junk datagram NO peer claims pays the FULL
+    // N-peer sweep before it is silently dropped — an O(peers) keyed-hash cost an
+    // off-path sender can force per packet WITHOUT authenticating. Measured here
+    // against the cleartext key_id selector (obfuscation off: a trivial integer
+    // scan of the same registry) to isolate the per-peer de-mux tax.
+    var wide: peer.PeerRegistry = undefined;
+    buildWideRegistry(&wide, psk, npeers) catch {
+        writeErr(io, "forward-bench: wide-registry construction FAILED — aborting\n");
+        return error.FixtureFailed;
+    };
+    const last_id: u32 = @intCast(1 + npeers); // ids run 2..npeers+1; the last is trialed last
+    const last = wide.findById(last_id).?;
+
+    // A genuine inbound datagram from the LAST peer (link last->1), sealed then
+    // header-masked exactly as that spoke's egress would (see reactor.stageEgress):
+    // `clr` is the cleartext-header form the O(1) selector reads, `obf` the mask.
+    var last_to_hub = crypto.TxSession.init(last.rx.link_key, EPOCH);
+    var clr: [MAX_WIRE]u8 = undefined;
+    const olen = reactor.encodeEgress(&last_to_hub, @intCast(last_id), pkt, &clr);
+    var obf: [MAX_WIRE]u8 = undefined;
+    @memcpy(obf[0..olen], clr[0..olen]);
+    reactor.obfuscateHeader(last.rx.link_key, obf[0..olen]);
+
+    // A deterministic junk datagram no peer's key recovers (worst-case full sweep).
+    var junk: [MAX_WIRE]u8 = undefined;
+    craftJunkMiss(&junk, olen, &wide);
+
+    // Self-checks (fail closed): a wrong build can never report a bogus rate.
+    {
+        const kid = reactor.parseKeyId(clr[0..olen]) orelse {
+            writeErr(io, "forward-bench: select self-check parseKeyId FAILED\n");
+            return error.SelfCheckFailed;
+        };
+        if (@as(u32, kid) != last_id) {
+            writeErr(io, "forward-bench: select self-check key_id MISMATCH — aborting\n");
+            return error.SelfCheckFailed;
+        }
+        // The genuine masked datagram must select its sender via the trial sweep;
+        // the hit de-masks `obf` in place (obf is consumed by this self-check).
+        const hit = selectTrial(&wide, obf[0..olen]) orelse {
+            writeErr(io, "forward-bench: select self-check genuine sweep MISSED — aborting\n");
+            return error.SelfCheckFailed;
+        };
+        if (hit.id != last_id) {
+            writeErr(io, "forward-bench: select self-check selected the wrong peer — aborting\n");
+            return error.SelfCheckFailed;
+        }
+        // And the junk datagram must miss the entire sweep.
+        if (selectTrial(&wide, junk[0..olen]) != null) {
+            writeErr(io, "forward-bench: select self-check junk unexpectedly matched — aborting\n");
+            return error.SelfCheckFailed;
+        }
+    }
+
+    writeOut(io, std.fmt.bufPrint(&hdr, "ingress peer-selection (obfuscation de-mux): peers={d}\n", .{npeers}) catch "");
+    const off_ns = blk: {
+        const t0 = nowNs(io);
+        var i: usize = 0;
+        while (i < iters) : (i += 1) {
+            const kid = reactor.parseKeyId(clr[0..olen]).?;
+            const sp = wide.findById(kid).?;
+            std.mem.doNotOptimizeAway(sp.id);
+        }
+        break :blk report(io, "cleartext select  ", iters, olen, nowNs(io) - t0);
+    };
+    const junk_ns = blk: {
+        const t0 = nowNs(io);
+        var i: usize = 0;
+        while (i < iters) : (i += 1) {
+            std.mem.doNotOptimizeAway(selectTrial(&wide, junk[0..olen]));
+        }
+        break :blk report(io, "obfusc. junk sweep", iters, olen, nowNs(io) - t0);
+    };
+    const per_peer = junk_ns / @as(f64, @floatFromInt(npeers));
+    var xbuf: [384]u8 = undefined;
+    writeOut(io, std.fmt.bufPrint(&xbuf, "  obfuscation de-mux tax: {d:.1} ns/op over cleartext select ({d:.1} -> {d:.1} ns/op across {d} peers, ~{d:.1} ns/peer of keyed Blake2b a junk datagram pays before silent drop)\n", .{
+        junk_ns - off_ns, off_ns, junk_ns, npeers, per_peer,
+    }) catch "");
 }
 
 /// Print "ops/sec, MB/sec, ns/op" for a measurement and return ns/op so the
@@ -345,4 +501,31 @@ test "forward-bench craftIpv4 produces a parser-valid packet" {
     craftIpv4(&buf, IP_SPOKE, IP_DEST);
     try std.testing.expectEqual(IP_SPOKE, reactor.ipv4Src(&buf).?);
     try std.testing.expectEqual(IP_DEST, reactor.ipv4Dst(&buf).?);
+}
+
+test "forward-bench wide registry: obfuscated datagram trial-selects its sender, junk misses the sweep" {
+    const psk: crypto.Key = [_]u8{0x42} ** crypto.KEY_LEN;
+    var reg: peer.PeerRegistry = undefined;
+    try buildWideRegistry(&reg, psk, 8);
+    const last_id: u32 = 9; // ids 2..9; the sender is trialed last (worst case)
+    const last = reg.findById(last_id).?;
+
+    var inner: [64]u8 = undefined;
+    craftIpv4(&inner, IP_SPOKE, IP_DEST);
+
+    // Genuine inbound datagram from the last peer (link last->1), then header-masked
+    // exactly as that spoke's egress would (obfuscate with its tx == hub rx key).
+    var tx = crypto.TxSession.init(last.rx.link_key, EPOCH);
+    var wire: [reactor.MAX_WIRE]u8 = undefined;
+    const wlen = reactor.encodeEgress(&tx, @intCast(last_id), &inner, &wire);
+    reactor.obfuscateHeader(last.rx.link_key, wire[0..wlen]);
+
+    // The trial sweep recovers the sender and de-masks the header in place.
+    const hit = selectTrial(&reg, wire[0..wlen]).?;
+    try std.testing.expectEqual(last_id, hit.id);
+
+    // A junk datagram no key recovers must miss the entire sweep.
+    var junk: [reactor.MAX_WIRE]u8 = undefined;
+    craftJunkMiss(&junk, wlen, &reg);
+    try std.testing.expect(selectTrial(&reg, junk[0..wlen]) == null);
 }
