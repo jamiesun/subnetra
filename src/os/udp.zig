@@ -287,20 +287,23 @@ test "UdpBatch loopback round-trips a batch (recv count, payloads, sources)" {
         _ = sys.sendto(tx, &payload, payload.len, 0, @ptrCast(&rx_addr), @sizeOf(sys.sockaddr.in));
     }
 
+    // Poll-and-drain until all k datagrams arrive. macOS defers loopback
+    // delivery, so a single wait followed by one drain-to-EAGAIN pass can
+    // observe only the first datagram and exit early; Linux delivers
+    // synchronously. The bounded retry budget keeps the test from hanging if a
+    // datagram is ever genuinely lost.
     var poller = os.Poller.init() catch return error.SkipZigTest;
     defer poller.deinit();
     poller.add(rx, .level) catch return error.SkipZigTest;
-    var ready: [4]sys.fd_t = undefined;
-    _ = poller.wait(&ready, 1000) catch return error.SkipZigTest;
+    var ready: [1]sys.fd_t = undefined;
 
     var b = UdpBatch{};
     var total: usize = 0;
     var seen = [_]bool{false} ** k;
-    // Drain to EAGAIN; a batch may arrive split across recv calls.
-    var rounds: usize = 0;
-    while (rounds < k + 2) : (rounds += 1) {
+    var attempts: usize = 0;
+    while (total < k and attempts < 50) : (attempts += 1) {
+        if ((poller.wait(&ready, 200) catch return error.SkipZigTest) == 0) continue;
         const got = b.recv(rx);
-        if (got == 0) break;
         var i: usize = 0;
         while (i < got) : (i += 1) {
             const d = b.datagram(i);
@@ -310,7 +313,6 @@ test "UdpBatch loopback round-trips a batch (recv count, payloads, sources)" {
             try std.testing.expectEqual(@as(u32, rx_addr.addr), b.source(i).addr);
             total += 1;
         }
-        if (total >= k) break;
     }
     try std.testing.expectEqual(@as(usize, k), total);
     for (seen) |s| try std.testing.expect(s);

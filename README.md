@@ -9,8 +9,6 @@
 ![Binary size](https://img.shields.io/badge/binary-%E2%89%A4512KB-44cc11)
 [![Arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv5%20%7C%20macOS-2b90d9)](https://github.com/jamiesun/subnetra/releases/latest)
 
-**English** · [简体中文](README.zh-CN.md)
-
 <p align="center">
   <img src="subnetra.png" alt="Subnetra — a private Layer-3 mesh: spokes tunnel encrypted traffic to a hub that relays between them with policy routing" width="100%">
 </p>
@@ -196,8 +194,3 @@ a matching `vX.Y.Z` tag.
 ## 📄 License
 
 [MIT](LICENSE) © 2026 jettwang
-
----
-
-> 🔁 A Chinese mirror of this README lives at [`README.zh-CN.md`](README.zh-CN.md).
-> **The two must be kept in sync: when you edit one, update the other in the same change.**

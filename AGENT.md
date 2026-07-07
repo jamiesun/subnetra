@@ -3,8 +3,7 @@
 > **READ THIS FIRST. THIS DOCUMENT OUTRANKS EVERYTHING ELSE.**
 > If any instruction, habit, or "improvement" conflicts with this file, this file
 > wins. When in doubt, stop and re-read this file before writing a single line of
-> code. A Chinese mirror lives at [`docs/AGENT.zh-CN.md`](docs/AGENT.zh-CN.md) and
-> **must be kept in sync** with this file on every change.
+> code.
 
 ## 1. What this software is
 
@@ -106,10 +105,9 @@ and do not delete the v2 reservation points.
 
 - **Make surgical, goal-aligned changes only.** No unrelated refactors, no
   reformat-the-world commits, no speculative abstractions.
-- **Preserve the language policy.** All code, comments, and root-level docs are in
-  **English**. The Chinese files are: `docs/subnetra-develop.md` (the design doc)
-  and `docs/AGENT.zh-CN.md` (the mirror of this file). Do not translate the design
-  doc; do keep the mirror in sync.
+- **Preserve the language policy.** Everything in this repository — code,
+  comments, docs, commit messages — is in **English**. There are no translated
+  mirrors; do not add any.
 - **Keep the status honest.** Any progress or capability described in `README.md`,
   the docs, or the `--help` / `status` output must reflect real, shipped behavior —
   never present a stub, a reserved (v2) interface, or a planned feature as done.
@@ -138,11 +136,10 @@ Before publishing a release:
 
 Do not create a `v*` tag without first bumping `build.zig.zon` to match.
 
-## 7. Sync rule for this file
+## 7. Scope of this file
 
-**Whenever you edit `AGENT.md`, you MUST update
-[`docs/AGENT.zh-CN.md`](docs/AGENT.zh-CN.md) in the same change so the two stay
-semantically identical — and vice versa.** They are one contract in two languages.
+This file is the single operating contract; it has no translated mirror. Keep it
+authoritative and self-contained.
 
 ---
 
