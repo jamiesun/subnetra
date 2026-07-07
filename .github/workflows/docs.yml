@@ -63,6 +63,7 @@ jobs:
           set -euo pipefail
           # The hero image is tracked once at the repo root; copy it into the
           # book source (git-ignored) instead of committing a duplicate.
+          mkdir -p docs-site/en/src/images
           cp subnetra.png docs-site/en/src/images/subnetra.png
           mdbook build docs-site/en
 

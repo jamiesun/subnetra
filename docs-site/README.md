@@ -44,6 +44,7 @@ The hero image is tracked once at the repo root and copied into the book at
 build time, so copy it first:
 
 ```bash
+mkdir -p docs-site/en/src/images
 cp subnetra.png docs-site/en/src/images/subnetra.png
 mdbook serve docs-site/en -p 3000 --open      # http://localhost:3000
 ```
@@ -51,6 +52,7 @@ mdbook serve docs-site/en -p 3000 --open      # http://localhost:3000
 ## Build
 
 ```bash
+mkdir -p docs-site/en/src/images
 cp subnetra.png docs-site/en/src/images/subnetra.png
 mdbook build docs-site/en      # → docs-site/en/book/
 ```
