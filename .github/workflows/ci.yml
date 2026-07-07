@@ -18,6 +18,8 @@ env:
   ZIG_VERSION: "0.16.0"
   # Pinned upstream SHA256 (x86_64-linux), see https://ziglang.org/download/index.json
   ZIG_SHA256_X86_64: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+  # Pinned upstream SHA256 (aarch64-macos), same source.
+  ZIG_SHA256_AARCH64_MACOS: "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
 
 jobs:
   unit-test:
@@ -51,6 +53,32 @@ jobs:
             exit 1
           fi
           echo "OK: no src/ -> tools/ imports."
+
+  # macOS is a first-class spoke platform (docs/macos-spoke-acceptance.md), so
+  # its unit-test baseline is gated here, not left to ad-hoc local runs. Unit
+  # tests only: the netns/TUN integration harness is Linux-only by design.
+  unit-test-macos:
+    name: Unit tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256_AARCH64_MACOS}  /tmp/zig.tar.xz" | shasum -a 256 -c -
+          sudo mkdir -p /opt/zig
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          sudo ln -s /opt/zig/zig /usr/local/bin/zig
+          zig version
+
+      - name: zig build test
+        run: zig build test --summary all
+
+      - name: zig build tools-test
+        run: zig build tools-test --summary all
 
   cross-build:
     name: Cross-build ${{ matrix.arch }} (static + size budget)
