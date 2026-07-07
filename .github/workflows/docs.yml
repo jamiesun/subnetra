@@ -1,8 +1,7 @@
 name: Docs
 
-# Build the bilingual (EN/ZH) mdBook documentation site under docs-site/ and
-# deploy it to GitHub Pages. The two books are assembled side by side so the
-# in-page language switcher can swap /en/ <-> /zh/ on the same path.
+# Build the mdBook documentation site under docs-site/ and deploy it to
+# GitHub Pages.
 
 on:
   push:
@@ -59,11 +58,13 @@ jobs:
           sudo ln -sf /opt/mdbook-mermaid/mdbook-mermaid /usr/local/bin/mdbook-mermaid
           mdbook-mermaid --version
 
-      - name: Build EN + ZH books
+      - name: Build the book
         run: |
           set -euo pipefail
+          # The hero image is tracked once at the repo root; copy it into the
+          # book source (git-ignored) instead of committing a duplicate.
+          cp subnetra.png docs-site/en/src/images/subnetra.png
           mdbook build docs-site/en
-          mdbook build docs-site/zh
 
       - name: Check intra-site links and anchors
         run: python3 docs-site/check-links.py
@@ -75,7 +76,6 @@ jobs:
           mkdir -p site
           cp docs-site/index.html site/index.html
           cp -r docs-site/en/book site/en
-          cp -r docs-site/zh/book site/zh
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

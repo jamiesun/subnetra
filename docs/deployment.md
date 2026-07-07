@@ -1,7 +1,5 @@
 # Subnetra production deployment guide
 
-> A Chinese translation is kept in sync at [`deployment.zh-CN.md`](deployment.zh-CN.md).
-
 This guide deploys a public **Hub** and two NATed **Spokes** so that hosts on the
 spokes' private LANs can reach each other through the Hub relay. Subnetra ships as
 a single static binary with no runtime dependencies, so deployment is mostly
@@ -654,7 +652,7 @@ where it has full network context (the host, router, or anycast fabric), not ins
 an allocation-free packet pump. Changing this is a v2 / **RFC amending the iron
 law**, not a feature PR — and is intentionally not on the backlog.
 
-## 9. Cross-ISP / cross-region traffic shaping (运营商跨区整形)
+## 9. Cross-ISP / cross-region traffic shaping
 
 On long, cross-ISP or cross-region links, the dominant cause of jitter and loss is
 **not** that the tunnel is "detected" — it is the underlay: ISP interconnect

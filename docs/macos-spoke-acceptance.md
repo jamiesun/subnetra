@@ -1,7 +1,7 @@
 # macOS spoke — manual real-machine acceptance runbook
 
-> Chinese translation is **not** kept for this runbook; it tracks the macOS
-> spoke MVP epic (#72) and the RFC [`macos-spoke-rfc.md`](macos-spoke-rfc.md) §8.
+> This runbook tracks the macOS spoke MVP epic (#72) and the RFC
+> [`macos-spoke-rfc.md`](macos-spoke-rfc.md) §8.
 
 ## Why this is a manual runbook (and the honest release gate)
 

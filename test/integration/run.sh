@@ -25,10 +25,10 @@
 #   7. Active-probe / stealth: unsolicited junk + an unauthenticated forgery sent
 #      to the live relay's UDP port must be PERFECTLY dropped — zero reply on the
 #      wire (proven by capture) — while the honest udp:unknown_peer /
-#      udp:auth_or_invalid drop counters rise and the daemon stays up (PRD §五.2).
+#      udp:auth_or_invalid drop counters rise and the daemon stays up (PRD §5.2).
 #   8. Memory soak + perf: sustained large-packet relay load; the relay's RSS must
 #      stay flat (iron law #2: zero data-plane allocation) and a rough relayed
-#      throughput baseline is recorded (PRD §五.2). The soak window is short by
+#      throughput baseline is recorded (PRD §5.2). The soak window is short by
 #      default (SUBNETRA_SOAK_SECS, default 15s); the PRD's 10-minute run is the
 #      manual/release acceptance target.
 #
@@ -559,7 +559,7 @@ EOF
 }
 e2e_netns_role
 
-# --- scenario 3: active-probe / stealth (PRD §五.2 probe-resistance) ----------
+# --- scenario 3: active-probe / stealth (PRD §5.2 probe-resistance) ----------
 # The stealth contract: a hostile party that sprays the relay's UDP port with
 # garbage (and with a structurally-valid-looking but unauthenticated forgery) must
 # get NOTHING back — no TCP reset, no ICMP, no UDP — and must not perturb the
@@ -649,7 +649,7 @@ e2e_active_probe() {
 }
 e2e_active_probe
 
-# --- scenario 4: memory soak + perf baseline (PRD §五.2 RSS-flat) -------------
+# --- scenario 4: memory soak + perf baseline (PRD §5.2 RSS-flat) -------------
 # Iron law #2 says the data plane is strictly allocation-free, so under sustained
 # load the relay's resident memory must be a flat line. We flood max-size packets
 # spoke-A -> Hub(relay) -> spoke-B, sample the Hub daemon's VmRSS after a warmup

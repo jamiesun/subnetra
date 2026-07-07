@@ -1,8 +1,10 @@
 # mdBook build output
 en/book/
-zh/book/
 book/
 /site/
+
+# Copied from the repo root by the docs workflow / local build (single tracked copy).
+en/src/images/subnetra.png
 
 # Python bytecode from check-links.py
 __pycache__/

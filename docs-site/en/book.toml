@@ -12,7 +12,7 @@ git-repository-url = "https://github.com/jamiesun/subnetra"
 edit-url-template = "https://github.com/jamiesun/subnetra/edit/main/docs-site/en/{path}"
 site-url = "/subnetra/en/"
 additional-css = ["theme/custom.css"]
-additional-js = ["theme/language-switcher.js", "mermaid.min.js", "mermaid-init.js"]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 no-section-label = false
 
 [output.html.fold]

@@ -14,7 +14,7 @@ import re
 import sys
 import pathlib
 
-LOCALES = ["en", "zh"]
+LOCALES = ["en"]
 
 # Markdown inline links, excluding images (![]()), allowing an optional title.
 LINK_RE = re.compile(r'(?<!\!)\[[^\]]*\]\(\s*([^)\s]+?)(?:\s+"[^"]*")?\s*\)')

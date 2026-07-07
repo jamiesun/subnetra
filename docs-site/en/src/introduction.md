@@ -6,9 +6,6 @@
 
 **Connect your servers, sites, and devices into one private, encrypted network — shipped as a single tiny binary that runs anywhere, from a cloud VM to a MikroTik router.**
 
-> This documentation site is bilingual. Use the **中文 / EN** toggle in the top
-> bar to switch languages, or read the [简体中文文档](https://jamiesun.github.io/subnetra/zh/).
-
 ## What is Subnetra?
 
 Subnetra stitches machines in different places — offices, a data center, roaming

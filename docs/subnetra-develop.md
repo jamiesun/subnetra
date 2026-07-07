@@ -1,119 +1,119 @@
-# Subnetra 系统需求与架构设计说明书（PRD & Architecture）
+# Subnetra System Requirements & Architecture Design (PRD & Architecture)
 
-本文件旨在为**高级 AI Agent（如 Claude 4.8 Opus）**提供完全闭环的系统上下文。文档采用**测试驱动开发（TDD）**导向，面向 **RouterOS Container（BusyBox 环境）**的极致克制场景，指导 Agent 独立完成从底层系统调用到控制面策略引擎的模块化编写。
+This document provides a fully closed-loop system context for an **advanced AI agent** (e.g. Claude 4.8 Opus). It is **test-driven development (TDD)** oriented, targets the extremely constrained **RouterOS Container (BusyBox environment)** scenario, and guides the agent through independently implementing every module, from raw syscalls to the control-plane policy engine.
 
-## 一、系统愿景与核心约束（Vision & Constraints）
+## 1. Vision & Constraints
 
-Subnetra 是一个用**纯 Zig（锁定 2026 最新标准库 `std.posix`）**编写的虚拟三层（Layer 3）自适应组网工具。系统专门优化用于海内外专线环境，彻底抛弃高开销的动态混淆，只追求极致的吞吐量与确定性。
+Subnetra is a virtual Layer-3 adaptive networking tool written in **pure Zig (pinned to the 2026 latest standard library `std.posix`)**. The system is optimized for domestic/overseas leased-line environments: it completely abandons high-overhead dynamic obfuscation and pursues nothing but maximum throughput and determinism.
 
-### AI Agent 必须绝对遵守的底层铁律
+### Iron laws the AI agent must obey absolutely
 
-1. **分层零动态内存分配（Layered Zero-Allocation）：** 内存约束按职责分层，禁止一刀切。
-   - **数据面（reactor / crypto）：严格零分配。** 所有数据包缓冲区、转发路径必须在启动时通过 `FixedBufferAllocator` 锁死在静态常驻内存中，运行期禁止任何隐式或频繁的 `alloc` 与 `free`。这是性能叙事的核心，必须死守。
-   - **控制面与可靠层（uds / policy 重建 / 未来的 KCP、FEC）：允许独立 arena。** 这些路径可在与数据面物理隔离的 arena 中分配，生命周期独立回收，不得污染数据面的常驻内存线。
-   - 验收时的「RSS 波动 0 字节」仅针对数据面（`raw_direct`）压测成立；控制面热更新允许短暂、可回收的 arena 波动。
-2. **单线程事件驱动反应堆（Reactor 模式）：** 严禁使用多线程（Thread）。必须基于 Linux epoll 边缘触发（`EPOLLET`）异步复用 `TUN_FD`、`UDP_FD` 和 `UDS_FD`。由于全程单线程，**数据面与控制面不存在并发竞争，禁止引入任何锁**；策略热更新通过原子指针交换（见下文 RCU 模型）实现。
-3. **完全无状态混淆：** 传输层报文使用 ChaCha20-Poly1305 全加密。密文禁止包含任何固定魔数（Magic Number）。对端认证失败必须直接丢弃（Drop），不回发任何 TCP Reset 或 ICMP 报文，对外部探测实现物理隐形。
-4. **传输安全铁律（密钥 / Nonce / 防重放）：** 隧道的命门，v1 必须落地，不得推迟。
-   - **密钥：** v1 采用**私有的每对端预共享密钥（per-peer PSK，issue #13）**：每个 `peers[]` 条目各带一个独立的 `psk` 字段（32 字节，64 位十六进制）；不再有全网共享的顶层 `psk`（旧配置若仍携带顶层 `psk` 会被 `InvalidPsk` 拒绝）。每条 Hub 链路一把私钥，链路密钥仍由 `deriveLinkKey(peer_psk, from_id, to_id)` 派生，因此攻破某个 spoke 的 PSK 无法派生或伪造其它链路。同一把 PSK 被多个对端复用会被 `DuplicatePsk` 拒绝。**无握手是永久设计约束（见 `AGENT.md` 铁律 #8）：本协议不做任何建链往返 / 会话协商。** v1 报头与 config 结构预留的协商版本字段，仅用于未来传输模式的**静态 per-link 配置选择**，绝不用于线缆握手。
-   - **Nonce：** ChaCha20-Poly1305 在 FixedBuffer 场景下**绝对禁止固定或复用 nonce**，否则认证保证当场归零。每端维护一个独立的 64-bit 单调递增计数器作为 nonce 来源，发送即自增，杜绝跨会话复用。
-     - **会话 epoch / 启动 nonce（issue #14，已落地）：** 不依赖磁盘持久化（铁律：无持久化状态）。守护进程启动时采样一次 `boot_epoch = CLOCK_REALTIME 纳秒`（u64），并由此派生**每会话密钥** `session_key = Blake2b256(link_key, "subnetra-v1-session" || epoch_be)`。每次重启都得到全新会话密钥，于是序列号可安全地从 1 重新开始而绝不复现历史 `(key, nonce)` 对。`boot_epoch` 随每个报文携带（8 字节，无握手）：接收端按 epoch 无状态派生匹配密钥，并做**前向唯一（forward-only）**裁决——更大（更晚）的 epoch 经认证后取代旧会话并**重置防重放窗口**（修复单边重启后窗口领先导致新流量被拒的可用性 bug）；更小的 epoch 直接 Drop（拦截退役会话的跨 epoch 重放）。认证恒在改动任何接收状态之前完成，伪造的高 epoch 无法污染会话。
-     - **失败即关闭（fail-closed）：** 时钟不可用或回报早于 2024-01-01 的墙钟（无 RTC / 未 NTP 同步）一律视为致命错误并拒绝启动，避免发出 0/过低且易碰撞的 epoch。
-     - **已记录的残留限制：** 若某节点墙钟在重启间**回退**（无 RTC 且尚未 NTP 同步），其新 epoch 可能小于对端记忆的旧 epoch，对端将拒绝新会话直至墙钟越过旧值。运维须保证时钟跨重启单调（RTC/NTP），或两端同时重启。**这是被接受的设计取舍，而非待修缺陷**：因无握手（铁律 #8），不存在双向 epoch 交换的对称修复；该限制仅由运维层（NTP/RTC，见 `docs/deployment.md`）缓解。
-   - **防重放：** 接收端维护滑动窗口（如 64 位 bitmap）校验序列号，窗口外或已见过的序列号一律 Drop。UDP 无状态传输必须配防重放，否则历史密文可被重放注入内网。
-5. **单二进制产物：** 编译产物必须是完全静态链接的独立二进制文件（基于 musl-libc）。体积口径统一为：使用 `-O ReleaseSmall` 时目标 **≤ 512KB**，整体 Docker 镜像压缩在 **4MB** 以内。（若为追求吞吐改用 `ReleaseFast`，则放宽体积上限并在 `build.zig` 注释中标注权衡。）
+1. **Layered zero dynamic allocation.** Memory constraints are layered by responsibility — no blanket rule.
+   - **Data plane (reactor / crypto): strictly allocation-free.** All packet buffers and forwarding paths must be locked into static resident memory at startup via a `FixedBufferAllocator`; any implicit or frequent `alloc`/`free` at runtime is forbidden. This is the core of the performance story and must be defended at all costs.
+   - **Control plane & reliability layer (uds / policy rebuild / future KCP, FEC): independent arenas allowed.** These paths may allocate in arenas physically isolated from the data plane, with independently reclaimed lifetimes, and must never pollute the data plane's resident memory line.
+   - The "0-byte RSS variation" acceptance criterion applies only to data-plane (`raw_direct`) load tests; control-plane hot updates may cause brief, reclaimable arena churn.
+2. **Single-threaded event-driven reactor.** Threads are strictly forbidden. Must be built on Linux epoll edge-triggered (`EPOLLET`) async multiplexing of `TUN_FD`, `UDP_FD`, and `UDS_FD`. Because the whole process is single-threaded, **there is no data-plane/control-plane concurrency, and introducing any lock is forbidden**; policy hot updates happen via atomic pointer swap (see the RCU model below).
+3. **Fully stateless obfuscation.** Transport packets use ChaCha20-Poly1305 full encryption. Ciphertext must contain no fixed magic numbers. Peer authentication failure must result in a silent Drop — never reply with a TCP Reset or ICMP message — achieving physical invisibility to external probes.
+4. **Transport-security iron law (keys / nonce / anti-replay).** The tunnel's lifeline; must land in v1, cannot be deferred.
+   - **Keys:** v1 uses **private per-peer pre-shared keys (per-peer PSK, issue #13)**: every `peers[]` entry carries its own `psk` field (32 bytes, 64 hex chars); there is no mesh-wide top-level `psk` any more (a legacy config still carrying a top-level `psk` is rejected with `InvalidPsk`). One private key per hub link; link keys are still derived via `deriveLinkKey(peer_psk, from_id, to_id)`, so compromising one spoke's PSK cannot derive or forge any other link. Reusing the same PSK across multiple peers is rejected with `DuplicatePsk`. **Handshake-freedom is a permanent design constraint (see `AGENT.md` iron law #8): this protocol performs no connection-establishment round-trip and no session negotiation.** The negotiation-version fields reserved in the v1 header and config structure exist only for future **static per-link configuration selection** of transport modes — never for an on-wire handshake.
+   - **Nonce:** ChaCha20-Poly1305 in a FixedBuffer setting **absolutely forbids fixed or reused nonces**, or the authentication guarantee collapses on the spot. Each endpoint maintains an independent 64-bit monotonically increasing counter as the nonce source, incremented on every send, eliminating cross-session reuse.
+     - **Session epoch / boot nonce (issue #14, shipped):** No disk persistence (iron law: no persisted state). At startup the daemon samples `boot_epoch = CLOCK_REALTIME nanoseconds` (u64) once and derives a **per-session key** `session_key = Blake2b256(link_key, "subnetra-v1-session" || epoch_be)`. Every restart yields a fresh session key, so the sequence number can safely restart at 1 without ever repeating a historical `(key, nonce)` pair. `boot_epoch` travels with every packet (8 bytes, no handshake): the receiver derives the matching key statelessly per epoch and applies a **forward-only** ruling — a larger (later) epoch, once authenticated, supersedes the old session and **resets the anti-replay window** (fixing the availability bug where a one-sided restart left the window ahead and rejected new traffic); a smaller epoch is dropped outright (blocking cross-epoch replay of retired sessions). Authentication always completes before any receive state is mutated; a forged high epoch cannot poison the session.
+     - **Fail-closed:** An unavailable clock, or a wall clock reporting earlier than 2024-01-01 (no RTC / not NTP-synced), is treated as a fatal error and the daemon refuses to start, avoiding a 0/too-low, collision-prone epoch.
+     - **Documented residual limitation:** If a node's wall clock **goes backward** across a restart (no RTC and not yet NTP-synced), its new epoch may be smaller than the old epoch the peer remembers; the peer will reject the new session until the wall clock passes the old value. Operations must keep clocks monotonic across restarts (RTC/NTP), or restart both ends together. **This is an accepted design trade-off, not a defect to fix**: because there is no handshake (iron law #8), no symmetric fix via bidirectional epoch exchange exists; the limitation is mitigated only at the operations layer (NTP/RTC, see `docs/deployment.md`).
+   - **Anti-replay:** The receiver maintains a sliding window (e.g. a 64-bit bitmap) to validate sequence numbers; anything outside the window or already seen is dropped. Stateless UDP transport must be paired with anti-replay, or historical ciphertext could be replayed into the private network.
+5. **Single-binary artifact.** The build product must be a fully statically linked standalone binary (musl-libc based). The size budget is uniform: with `-O ReleaseSmall` the target is **≤ 512KB**, and the overall Docker image compresses to within **4MB**. (If `ReleaseFast` is chosen for throughput, relax the size cap and document the trade-off in a `build.zig` comment.)
 
-## 二、完整系统架构设计（System Architecture）
+## 2. System Architecture
 
-### 1. 网络拓扑与虚拟层数据流
+### 1. Network topology and virtual-layer data flow
 
-系统采用**星型拓扑（Hub-and-Spoke）**。海外中继节点作为 Hub，各 Spoke 客户端（如 RouterOS 容器）通过私有 UDP 隧道接入，在物理专线之上构建虚拟 `10.0.0.0/24` 子网，并支持跨网段（如 `192.168.1.0/24`）的 Site-to-Site 路由。
+The system uses a **hub-and-spoke (star) topology**. An overseas relay node acts as the hub; spoke clients (e.g. RouterOS containers) attach over private UDP tunnels, building a virtual `10.0.0.0/24` subnet on top of the physical leased line, with cross-subnet (e.g. `192.168.1.0/24`) site-to-site routing.
 
 ```text
-[局域网流量] -> [RouterOS 内核] -> (路由指向 tun0) -> [/dev/net/tun]
-                                                          |
-    +----------------------------------------------------+
-    | (非阻塞 epoll 边缘触发读取裸 IP 包)
+[LAN traffic] -> [RouterOS kernel] -> (route points at tun0) -> [/dev/net/tun]
+                                                                     |
+    +----------------------------------------------------------------+
+    | (non-blocking epoll edge-triggered read of raw IP packets)
     v
-[Subnetra 核心反应堆]
+[Subnetra core reactor]
     |
-    ├── 1. 读取原始 IP 头 (提取 Src IP / Dst IP)
-    ├── 2. 原子加载 active_tree 指针 (无锁只读，判定 FORWARD 或 DROP)
-    ├── 3. 组装私有报头 (packed struct：含 8B 序列号/nonce)
-    ├── 4. 经 egress 分发出口 (v1 仅 raw_direct；KCP/FEC 为 v2 预留分支)
-    └── 5. ChaCha20-Poly1305 加密 (nonce=序列号，追加 16B Tag)
+    ├── 1. Read the raw IP header (extract Src IP / Dst IP)
+    ├── 2. Atomically load the active_tree pointer (lock-free read; FORWARD or DROP)
+    ├── 3. Assemble the private header (packed struct: incl. 8B sequence number/nonce)
+    ├── 4. Dispatch via egress (v1 ships raw_direct only; KCP/FEC are reserved v2 branches)
+    └── 5. ChaCha20-Poly1305 encryption (nonce = sequence number, append 16B tag)
     |
     v
-[物理 UDP 套接字] -> (公网专线隧道传输，延时 < 100ms) -> [海外中继 Hub]
+[Physical UDP socket] -> (public leased-line tunnel, latency < 100ms) -> [overseas relay hub]
 ```
 
-### 2. 关键内存模型
+### 2. Key memory model
 
-- **私有报头：** 使用 Zig packed struct 物理对齐。报头需容纳：1 字节版本、1 字节标志位、2 字节 `key_id`（issue #34，发送端自身的 mesh id，接收端据此选择对端 PSK 与会话，实现 NAT/漫游下的端点重学习；该字段在 AEAD 之外，篡改只会选错密钥导致认证失败）、**8 字节会话 epoch（issue #14，标识发送端当前会话生命周期，供接收端无状态派生会话密钥并按会话裁决防重放）**、**8 字节单调递增序列号（兼作 ChaCha20-Poly1305 的 nonce 与防重放依据）**。报头长度按字段重新核算，当前实测为 **20 字节**（以 packed struct 实际对齐为准；`HEADER_LEN == 20` 有 comptime 断言守护）。注意 MTU 口径：外层 UDP 报文 = 报头(20) + 密文 + Tag(16) + UDP(8) + IP(20)，部署时 `local_tun_mtu` 应据此预留以避免分片。
-- **并发控制（无锁 RCU 模型）：** 全程单线程，**不使用任何锁**。策略树以 `*const PolicyTree` 形式被数据面原子只读（`@atomicLoad`）。控制面 UDS 注入规则时，在独立 arena 中**构建一棵全新的树**，构建完成后用一次 `@atomicStore` 将 `active_tree` 指针整体交换（RCU 思路）；旧树在下一轮事件循环空闲时回收。数据面从头到尾只读一个不变指针，热替换零拷贝、零抖动。
+- **Private header:** A physically aligned Zig packed struct. The header must hold: 1-byte version, 1-byte flags, 2-byte `key_id` (issue #34 — the sender's own mesh id; the receiver uses it to select the peer PSK and session, enabling endpoint relearning under NAT/roaming; the field sits outside the AEAD, so tampering only selects the wrong key and fails authentication), **8-byte session epoch (issue #14 — identifies the sender's current session lifetime so the receiver can statelessly derive the session key and scope anti-replay per session)**, and an **8-byte monotonically increasing sequence number (doubling as the ChaCha20-Poly1305 nonce and the anti-replay basis)**. The header length is recomputed from the fields and currently measures **20 bytes** (per the packed struct's actual alignment; a comptime assertion guards `HEADER_LEN == 20`). Mind the MTU accounting: outer UDP datagram = header(20) + ciphertext + tag(16) + UDP(8) + IP(20); deployments must budget `local_tun_mtu` accordingly to avoid fragmentation.
+- **Concurrency control (lock-free RCU model):** Single-threaded throughout, **no locks of any kind**. The policy tree is read atomically by the data plane as a `*const PolicyTree` (`@atomicLoad`). When the control-plane UDS injects rules, it **builds an entirely new tree** in an independent arena, then swaps the `active_tree` pointer wholesale with a single `@atomicStore` (RCU style); the old tree is reclaimed at the next idle point of the event loop. The data plane only ever reads one immutable pointer — hot replacement is zero-copy and jitter-free.
 
-## 三、功能清单与实现规范（Feature List）
+## 3. Feature List & Implementation Spec
 
-### 模块 1：数据面核心反应堆（Data-Plane Reactor）
+### Module 1: Data-plane core reactor
 
-- [ ] **TUN 网卡异步挂载：** 通过原生系统调用打开 `/dev/net/tun`，利用 ioctl 实例化虚拟网卡，设置 `O_NONBLOCK`。
-- [ ] **epoll 盲转引擎：** 统一调度 `TUN_FD` 与外网 `UDP_FD`，使用 `MSG_DONTWAIT` 循环读尽内核缓冲区，精确捕获并处理 `EWOULDBLOCK`。
-- [ ] **自适应多模式流控（接口预留，分期实现）：** 出口统一经 `egress(mode, pkt)` 分发（tagged-union / vtable），新增模式只填分支，不动主循环。
-  - **v1（必交付）** `raw_direct`：跳过所有重传，MTU 设为 1452 字节。
-  - **v2（Roadmap，接口预留，分支暂 `return error.NotImplemented`）** `kcp_arq`：在控制/可靠层 arena 中**自研** arena 版 ARQ（不引入 ikcp.c 等第三方 C 库，避免其内部 malloc 与零分配铁律冲突），消化专线微小丢包，MTU 设为 1428 字节。
-  - **v2（Roadmap）** `fec_xor`：自研前向纠错。注意：4:1 XOR 仅能恢复「每 5 包恰好丢 1 包」，对连续丢包无效，v2 设计时需重新评估纠错策略（如更高冗余或交织）。
+- [ ] **Async TUN attachment:** Open `/dev/net/tun` via raw syscalls, instantiate the virtual NIC with ioctl, set `O_NONBLOCK`.
+- [ ] **epoll blind-forwarding engine:** Uniformly schedule `TUN_FD` and the external `UDP_FD`, drain the kernel buffer in a loop with `MSG_DONTWAIT`, and precisely catch and handle `EWOULDBLOCK`.
+- [ ] **Adaptive multi-mode flow control (interface reserved, phased delivery):** All egress goes through a single `egress(mode, pkt)` dispatch (tagged union / vtable); adding a mode only adds a branch and never touches the main loop.
+  - **v1 (must ship)** `raw_direct`: skip all retransmission, MTU 1452 bytes.
+  - **v2 (roadmap; interface reserved, branch returns `error.NotImplemented` for now)** `kcp_arq`: an **in-house** arena-based ARQ in the control/reliability arena (never vendoring ikcp.c or other third-party C — their internal malloc conflicts with the zero-allocation iron law), absorbing minor leased-line loss, MTU 1428 bytes.
+  - **v2 (roadmap)** `fec_xor`: in-house forward error correction. Note: 4:1 XOR only recovers "exactly 1 loss per 5 packets" and is useless against burst loss; the v2 design must re-evaluate the coding strategy (higher redundancy or interleaving).
 
-### 模块 2：多网段命令行策略引擎（Policy Engine & CLI）
+### Module 2: Multi-subnet command-line policy engine (Policy Engine & CLI)
 
-- [ ] **CIDR 动态解析：** 支持将 `"192.168.1.0/24"` 字符串高效解析为 u32 网络号与掩码。
-- [ ] **Unix Domain Socket（UDS）通信：** 守护进程监听 `/run/subnetra/subnetra.sock`（macOS 为 `/var/run/subnetra.sock`）。
-- [ ] **独立控制工具 subnetra：** 20KB 的轻量客户端，通过 UDS 向主进程动态发送明文指令：
+- [ ] **Dynamic CIDR parsing:** Efficiently parse strings like `"192.168.1.0/24"` into a u32 network number and mask.
+- [ ] **Unix Domain Socket (UDS) transport:** The daemon listens on `/run/subnetra/subnetra.sock` (`/var/run/subnetra.sock` on macOS).
+- [ ] **Standalone control tool `subnetra`:** A 20KB lightweight client that sends plaintext commands to the main process over UDS:
   - `subnetra policy add --src X --dst Y --action forward --target Z`
   - `subnetra policy show`
-  - `subnetra save`（触发主进程将当前内存策略树序列化覆写回配置文件）
+  - `subnetra save` (makes the main process serialize the in-memory policy tree back over the config file)
 
-### 模块 3：启动与配置快照模块（Configuration Snapshot）
+### Module 3: Startup & configuration snapshot
 
-- [ ] **std.json 安全吞入：** 启动时一次性解析 `config.json`，若文件缺失，自动加载 comptime 编译期硬编码的缺省底盘配置。
-- [ ] **防呆边界自检（Sanity Check）：** 强制校验 MTU 是否在合理区间（68 ～ 1500），自动检查虚拟子网与 ROS 宿主机物理子网是否重叠，异常则熔断启动。
+- [ ] **Safe `std.json` ingestion:** Parse `config.json` once at startup; if the file is missing, fall back to the comptime hard-coded default baseline config.
+- [ ] **Fool-proof sanity check:** Enforce that the MTU lies in a sane range (68–1500), automatically check that the virtual subnet does not overlap the ROS host's physical subnet, and abort startup on any violation.
 
-## 四、开发任务清单（Task Backlog）
+## 4. Task Backlog
 
-AI Agent 需按照以下原子任务顺序，采用 **TDD 模式**逐步推进：
+The AI agent must proceed through the following atomic tasks in order, in **TDD mode**:
 
-- [ ] **任务 1（编译配置）：** 编写 `build.zig`。支持 `-target x86_64-linux-musl` 和 `-target aarch64-linux-musl` 的全静态交叉编译。默认 `-O ReleaseSmall` 剔离调试信息、精简体积（目标 ≤ 512KB）。
-- [ ] **任务 2（配置自检）：** 编写 `config.zig`。实现 JSON 解析器与编译期备用配置，定义私有的每对端 `peers[].psk` 与协商版本字段。编写测试用例验证非法的 MTU 输入能正确被拦截。
-- [ ] **任务 3（策略匹配）：** 编写 `policy.zig`。定义 `PolicyEntry` 结构体，实现基于位运算（`ip & mask`）的逆序最长前缀匹配。**不加锁**；策略树以 `*const PolicyTree` 提供原子只读接口与一个 `swap(new_tree)` 原子指针交换接口（RCU），通过「热替换后旧指针仍可安全读取」的单元测试。
-- [ ] **任务 4（系统驱动）：** 编写 `tun.zig`。使用最新的 `std.posix` 进行 ioctl 系统调用，完成虚拟网卡的无依赖初始化。
-- [ ] **任务 5（密码学管道）：** 编写 `crypto.zig`。封装 `std.crypto.stream.chacha20.ChaCha20Poly1305`，实现固定大小切片（Slice）的加密与认证，运行时无内存分配。**Nonce 由每端 64-bit 单调递增计数器派生，绝不复用**；接收端实现滑动窗口防重放校验。
-- [ ] **任务 6（核心反应堆）：** 编写 `reactor.zig`。构建单线程 `epoll_wait` 闭环状态机。分别处理 TUN 可读、UDP 可读、UDS 可读事件，实现底层数据的非阻塞盲转；出口走 egress 分发（v1 仅 `raw_direct`）。
-- [ ] **任务 7（控制面 UDS）：** 编写 `uds.zig`。建立本地 Unix 域套接字监听器，编写字符串 Token 分词器，在 arena 中重建策略树后调用 `policy.zig` 的原子 swap 接口（无锁注入）。
-- [ ] **任务 8（控制工具）：** 编写 `subnetra.zig`。编写精简的分支控制逻辑，负责将终端命令行参数打包成文本流通过 UDS 掷给主进程。
+- [ ] **Task 1 (build config):** Write `build.zig`. Support fully static cross-compilation for `-target x86_64-linux-musl` and `-target aarch64-linux-musl`. Default `-O ReleaseSmall`, strip debug info, minimize size (target ≤ 512KB).
+- [ ] **Task 2 (config sanity):** Write `config.zig`. Implement the JSON parser and the comptime fallback config; define the private per-peer `peers[].psk` and the negotiation-version field. Write test cases proving illegal MTU input is rejected.
+- [ ] **Task 3 (policy matching):** Write `policy.zig`. Define the `PolicyEntry` struct and implement reverse-order longest-prefix matching with bit operations (`ip & mask`). **No locks**; the policy tree exposes an atomic read-only `*const PolicyTree` interface plus one `swap(new_tree)` atomic pointer-swap interface (RCU), verified by a unit test proving "the old pointer remains safely readable after a hot swap".
+- [ ] **Task 4 (system driver):** Write `tun.zig`. Use the latest `std.posix` for the ioctl syscalls and complete dependency-free virtual-NIC initialization.
+- [ ] **Task 5 (crypto pipeline):** Write `crypto.zig`. Wrap `std.crypto.stream.chacha20.ChaCha20Poly1305`, implementing fixed-size-slice encryption and authentication with zero runtime allocation. **The nonce derives from each endpoint's 64-bit monotonic counter and is never reused**; the receiver implements sliding-window anti-replay validation.
+- [ ] **Task 6 (core reactor):** Write `reactor.zig`. Build the single-threaded `epoll_wait` closed-loop state machine. Handle TUN-readable, UDP-readable, and UDS-readable events, implementing non-blocking blind forwarding of raw data; egress goes through the dispatch (v1 ships `raw_direct` only).
+- [ ] **Task 7 (control-plane UDS):** Write `uds.zig`. Create the local Unix-domain-socket listener and a string tokenizer; rebuild the policy tree in an arena, then call `policy.zig`'s atomic swap interface (lock-free injection).
+- [ ] **Task 8 (control tool):** Write `subnetra.zig`. Implement the minimal branch logic that packs terminal command-line arguments into a text stream and throws it at the main process over UDS.
 
-> **分期说明：** v1 仅交付 `raw_direct` 数据面 + PSK 加密 + 防重放 + RCU 热更新策略。`kcp_arq` / `fec_xor` 为 v2 Roadmap，仅预留 `egress` 分支与报头协商字段，不在 v1 实现；**Roadmap 上没有握手——任何传输模式都由静态 per-link 配置选择（铁律 #8），绝不在线缆上协商。**
+> **Phasing note:** v1 delivers only the `raw_direct` data plane + PSK encryption + anti-replay + RCU hot-updated policy. `kcp_arq` / `fec_xor` are the v2 roadmap — only the `egress` branch and the header negotiation field are reserved; they are not implemented in v1. **There is no handshake on the roadmap — any transport mode is selected by static per-link configuration (iron law #8), never negotiated on the wire.**
 
-## 五、TDD 测试用例与验收清单（Acceptance Criteria）
+## 5. TDD Test Cases & Acceptance Criteria
 
-Agent 必须通过以下测试用例和现实场景校验，方可宣布交付：
+The agent may declare delivery only after passing the following test cases and real-world scenario checks:
 
-### 1. 单元测试覆盖要求（Unit Tests）
+### 1. Unit-test coverage requirements
 
-在开发期间，Agent 必须通过执行 `zig test src/main.zig` 跑通以下断言：
+During development, the agent must keep the following assertions green via `zig test src/main.zig`:
 
-- **`test "JSON Parser & Sanity Check"`**：输入 `local_tun_mtu: 9000` 触发断言错误；输入非法 JSON 触发解析终止。
-- **`test "CIDR Overlap & Matching"`**：验证规则树中，当同时存在 `0.0.0.0/0`（DROP）和 `192.168.2.0/24`（FORWARD）时，目标为 `192.168.2.100` 的流量必须命中 FORWARD，目标为 `8.8.8.8` 的流量必须命中 DROP。
-- **`test "RCU Hot-Swap"`**：在数据面持有旧 `active_tree` 指针期间执行一次 `swap(new_tree)`，旧指针仍能安全读出原规则，新读取命中新规则，且全程无锁、无数据面分配。
-- **`test "Crypto Invariance"`**：验证 1000 次随机生成的裸 IP 包经过 encrypt 后长度精确增加 16 字节（Tag），且经过 decrypt 后明文绝对一致。
-- **`test "Nonce Monotonic & Anti-Replay"`**：验证连续加密的 nonce 严格递增且不重复；接收端对窗口外或已见过的序列号必须 Drop，乱序但在窗口内的序列号必须接受。
+- **`test "JSON Parser & Sanity Check"`**: input `local_tun_mtu: 9000` triggers an assertion error; invalid JSON aborts parsing.
+- **`test "CIDR Overlap & Matching"`**: with both `0.0.0.0/0` (DROP) and `192.168.2.0/24` (FORWARD) in the rule tree, traffic to `192.168.2.100` must hit FORWARD and traffic to `8.8.8.8` must hit DROP.
+- **`test "RCU Hot-Swap"`**: while the data plane holds the old `active_tree` pointer, perform one `swap(new_tree)`; the old pointer must still read the original rules safely, new reads must hit the new rules, and the whole sequence must be lock-free with zero data-plane allocation.
+- **`test "Crypto Invariance"`**: 1000 randomly generated raw IP packets must each grow by exactly 16 bytes (the tag) after encrypt, and decrypt must reproduce the plaintext exactly.
+- **`test "Nonce Monotonic & Anti-Replay"`**: consecutive encryptions must produce strictly increasing, never-repeating nonces; the receiver must Drop out-of-window or already-seen sequence numbers and accept out-of-order ones inside the window.
 
-### 2. 运行时终极验收清单（Runtime Checklist）
+### 2. Runtime final acceptance checklist
 
-- [ ] **无依赖校验：** 在 Linux 终端执行 `ldd ./subnetrad`，输出结果必须显示 `not a dynamic executable`（纯静态链接）。
-- [ ] **体积校验：** 执行 `ls -lh ./subnetrad`，二进制产物体积必须小于 **512KB**。
-- [ ] **内存不泄露校验：** 将程序部署在 BusyBox 容器内，使用 `top` 或 `pmap` 监控其常驻内存（RSS）。在专线跑满千兆带宽（大包压测）10 分钟后，内存线必须是一条绝对平直的直线，波动为 **0 字节**。
-- [ ] **主动探测防封锁校验：** 使用第三方工具（如 `nc -u`）向运行中的 Subnetra 中继服务器 UDP 端口发送非法的二进制垃圾数据（含重放旧密文），中继服务器的 CPU 必须无异常波动，且网络抓包显示对端**没有回复任何数据包（完美 Drop）**；重放包必须被滑动窗口拦截。
-- [ ] **动态策略热更新校验：** 在网络运行中，执行 `./subnetra policy add --src 192.168.1.0/24 --dst 192.168.2.0/24 --action forward --target 3`，上层正在进行的 TCP 吞吐测试延迟抖动不得超过 **2ms**，证明原子指针交换（RCU）与非阻塞事件反应堆的零拷贝热替换工作完美。
+- [ ] **Zero-dependency check:** Running `ldd ./subnetrad` on a Linux terminal must print `not a dynamic executable` (purely static linking).
+- [ ] **Size check:** `ls -lh ./subnetrad` must show the binary under **512KB**.
+- [ ] **No-memory-leak check:** Deploy in a BusyBox container and watch resident memory (RSS) with `top` or `pmap`. After 10 minutes of gigabit large-packet load on the leased line, the memory line must be perfectly flat — **0 bytes** of variation.
+- [ ] **Active-probe resistance check:** Use a third-party tool (e.g. `nc -u`) to send invalid binary junk (including replayed old ciphertext) at the running Subnetra relay's UDP port. The relay's CPU must show no abnormal spike, and packet capture must show the peer **replies with nothing at all (a perfect Drop)**; replayed packets must be blocked by the sliding window.
+- [ ] **Dynamic policy hot-update check:** While the network is live, run `./subnetra policy add --src 192.168.1.0/24 --dst 192.168.2.0/24 --action forward --target 3`; the latency jitter of an in-flight upper-layer TCP throughput test must not exceed **2ms**, proving the atomic pointer swap (RCU) and the non-blocking event reactor's zero-copy hot replacement work flawlessly.
 
 ---
 
-**Punchline（给 Agent 的终极提示）：** 保持代码的纯粹。拒绝任何第三方网络框架（包括 ikcp.c），v2 的可靠层也须自研 arena 版 ARQ，紧抱最新的 `std.posix`。记住：v1 只交付 `raw_direct` 数据面 + PSK 加密 + 防重放 + RCU 热更新，KCP/FEC 仅预留接口（**无握手——铁律 #8**）。当你准备好构建这个完美契合 RouterOS 容器的底层钢铁管道时，请先从生成任务 1 的 `build.zig` 和任务 2 的配置自检单元测试代码开始。
+**Punchline (the agent's final reminder):** Keep the code pure. Reject every third-party network framework (including ikcp.c); the v2 reliability layer must also be an in-house arena ARQ; hold tight to the latest `std.posix`. Remember: v1 ships only the `raw_direct` data plane + PSK encryption + anti-replay + RCU hot updates; KCP/FEC are interface reservations only (**no handshake — iron law #8**). When you are ready to build this steel pipe purpose-fitted to the RouterOS container, start by generating Task 1's `build.zig` and Task 2's config-sanity unit tests.
