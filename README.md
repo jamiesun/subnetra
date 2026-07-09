@@ -173,6 +173,7 @@ taxonomy, and alerting examples.
 - 🎛 [**Control-plane protocol**](docs/CONTROL-PROTOCOL.md) — the local UDS API to manage/monitor a running daemon from any language (no FFI).
 - 🍏 [**macOS spoke runbook**](docs/macos-spoke-acceptance.md) · 🛰 [**RouterOS container guide**](docs/routeros-container.md)
 - 🏗 [**Design & architecture**](docs/subnetra-develop.md) — the PRD and system design.
+- 🗺 [**Roadmap & acceptance matrix**](docs-site/en/src/reference/roadmap.md) — what ships, what never will, and the capability coverage matrix every feature must satisfy.
 - 📦 [**Releases**](https://github.com/jamiesun/subnetra/releases/latest) · 🐳 [**Container image**](https://github.com/jamiesun/subnetra/pkgs/container/subnetra) · ⚙️ [**Example config**](config.example.json)
 
 ## 🛠 Build from source
@@ -190,6 +191,13 @@ Linux dev container and integration/benchmark harness live under
 [`.devcontainer/`](.devcontainer/) and [`test/integration/`](test/integration/);
 releases are cut by bumping `.version` in [`build.zig.zon`](build.zig.zon) and pushing
 a matching `vX.Y.Z` tag.
+
+**Quality & acceptance:** every top-level capability is tracked in the
+[**acceptance matrix**](docs-site/en/src/reference/roadmap.md#acceptance-matrix-capability-coverage-matrix)
+with a hard coverage floor — a Happy-Path E2E per capability, a failure path for
+high-risk ones, two-role checks on permission surfaces, recovery/rollback for
+state-mutating operations, and a new E2E + matrix row with every new capability
+([`AGENT.md` §6](AGENT.md)).
 
 ## 📄 License
 
