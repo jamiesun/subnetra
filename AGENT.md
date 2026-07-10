@@ -115,7 +115,36 @@ and do not delete the v2 reservation points.
   binary still links statically and stays under the size budget before declaring a
   task complete.
 
-## 6. Release & versioning discipline
+## 6. Acceptance matrix — hard rules
+
+The roadmap document **must** contain an acceptance chapter in the form of a
+business **Capability Coverage Matrix**. The single source of truth for the full
+matrix is [`docs-site/en/src/reference/roadmap.md`](docs-site/en/src/reference/roadmap.md)
+(“Acceptance matrix”); this section states the binding rules and never copies the
+table.
+
+The coverage floor below is **MUST-level**. Like the iron laws in §3, these rules
+may not be weakened, deferred, or reinterpreted as suggestions:
+
+1. Every **top-level business capability** MUST have at least one **Happy-Path
+   E2E** verification.
+2. Every **high-risk** capability (crypto/security, live routing state, external
+   side effects) MUST cover at least one **failure path**.
+3. Every **permission-touching** capability MUST be verified with at least **two
+   roles/principals** (for Subnetra's `0600` control socket: owner vs. any other
+   principal).
+4. Every operation that **mutates system state** MUST verify at least one
+   **recovery or rollback after failure**.
+5. Every **new top-level business capability** MUST land together with its E2E
+   **and** a new row in the acceptance matrix. A feature PR without both is
+   **incomplete** and must not merge.
+
+The matrix constrains *what must be proven and to what depth* — never the test
+framework, directory layout, or style. Evidence cells MUST point at real test
+paths; a missing test is recorded as an explicit gap, never invented. Removing a
+capability removes its row.
+
+## 7. Release & versioning discipline
 
 The release version lives in **exactly one place**: the `.version` field of
 [`build.zig.zon`](build.zig.zon). It is injected into the daemon banner at build
@@ -136,7 +165,7 @@ Before publishing a release:
 
 Do not create a `v*` tag without first bumping `build.zig.zon` to match.
 
-## 7. Scope of this file
+## 8. Scope of this file
 
 This file is the single operating contract; it has no translated mirror. Keep it
 authoritative and self-contained.
