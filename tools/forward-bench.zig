@@ -13,12 +13,15 @@
 //!
 //!   ingress-select (obfuscation de-mux, `selectIngressPeer`):
 //!     with header obfuscation ON (the default) the wire key_id is masked, so the
-//!     reactor cannot index a peer directly — it trials every configured peer's
-//!     rx link key via a keyed-Blake2b `tryDeobfuscate` until one recovers a
-//!     self-consistent header. A junk datagram NO peer claims pays the FULL
-//!     peer-count sweep before it is silently dropped; measured against the
-//!     cleartext key_id selector (obfuscation off) to expose the per-peer de-mux
-//!     cost that scales with the configured peer count.
+//!     reactor cannot index a peer directly — it trials peers' rx link keys via a
+//!     keyed-Blake2b `tryDeobfuscate` until one recovers a self-consistent
+//!     header. Since issue #174 the live reactor tries the source-endpoint peer
+//!     first (steady-state O(1)) and meters the fallback full sweep with a
+//!     per-drain budget; what this tool measures is that fallback's worst case —
+//!     a junk datagram NO peer claims paying the FULL peer-count sweep (i.e. one
+//!     budget slot) before it is silently dropped — against the cleartext key_id
+//!     selector (obfuscation off) to expose the per-peer de-mux cost that scales
+//!     with the configured peer count.
 //!
 //! The tx/rx pipeline numbers are also printed against the raw AEAD floor measured
 //! in the same run (seal for tx, open for rx) so the "forwarding tax" — the parse +
@@ -148,11 +151,13 @@ fn buildWideRegistry(reg: *peer.PeerRegistry, psk: crypto.Key, npeers: usize) !v
     }
 }
 
-/// Mirror of the reactor's obfuscation-ON ingress selection (`selectIngressPeer`):
+/// Mirror of the reactor's obfuscation-ON ingress FALLBACK selection (the
+/// budget-metered full sweep inside `selectIngressPeer`, issue #174):
 /// trial-de-obfuscate `wire` against every peer's rx link key, returning the first
 /// whose keyed-Blake2b pad recovers a self-consistent header (de-masking `wire` IN
 /// PLACE on the hit) or null if none claim it. This is the O(peers) keyed-hash
-/// sweep the daemon runs per inbound datagram when header obfuscation is on.
+/// sweep the daemon runs per unknown-source datagram (up to `OBFS_SCAN_BUDGET`
+/// times per drain) when header obfuscation is on.
 fn selectTrial(reg: *peer.PeerRegistry, wire: []u8) ?*peer.Peer {
     var i: usize = 0;
     while (i < reg.len) : (i += 1) {
@@ -349,14 +354,15 @@ pub fn main(init: std.process.Init) !void {
 
     // --- ingress peer-selection: the header-obfuscation de-mux sweep ---
     // With obfuscation ON (default) the wire key_id is masked, so the reactor
-    // cannot index a peer directly: `selectIngressPeer` trials every configured
-    // peer's rx link key via a keyed-Blake2b `tryDeobfuscate` until one recovers a
-    // self-consistent header. A genuine datagram hits after up to N trials (the
-    // sender's registry position); a junk datagram NO peer claims pays the FULL
-    // N-peer sweep before it is silently dropped — an O(peers) keyed-hash cost an
-    // off-path sender can force per packet WITHOUT authenticating. Measured here
-    // against the cleartext key_id selector (obfuscation off: a trivial integer
-    // scan of the same registry) to isolate the per-peer de-mux tax.
+    // cannot index a peer directly. Since issue #174 `selectIngressPeer` resolves
+    // steady-state traffic with ONE keyed trial via the source-endpoint fast
+    // path; only an unknown-source datagram falls back to trialing every
+    // configured peer's rx link key, and at most `OBFS_SCAN_BUDGET` such sweeps
+    // run per drain. This bench measures that fallback sweep's worst case: a
+    // junk datagram NO peer claims pays the FULL N-peer keyed-Blake2b sweep (one
+    // budget slot) before it is silently dropped. Measured against the cleartext
+    // key_id selector (obfuscation off: a trivial integer scan of the same
+    // registry) to isolate the per-peer de-mux tax.
     var wide: peer.PeerRegistry = undefined;
     buildWideRegistry(&wide, psk, npeers) catch {
         writeErr(io, "forward-bench: wide-registry construction FAILED — aborting\n");

@@ -61,6 +61,12 @@ pub const Counters = struct {
     /// Malformed header (incl. too short to parse), authentication failure,
     /// replay, or stale/zero epoch (collapsed: see the module note).
     drop_udp_auth_or_invalid: u64 = 0,
+    /// Obfuscation full-scan budget spent (issue #174): a datagram from an
+    /// unknown source endpoint needed a full-registry key trial after this
+    /// drain's `OBFS_SCAN_BUDGET` was exhausted. Under a spoofed-source flood
+    /// this counts the junk kept off the CPU; a genuinely roaming peer landing
+    /// here simply retries next drain. Only ever increments with obfuscation on.
+    drop_udp_scan_budget: u64 = 0,
     drop_udp_not_ipv4: u64 = 0,
     /// Inner source outside the peer's allowed_src prefix (anti-spoofing).
     drop_udp_spoof: u64 = 0,

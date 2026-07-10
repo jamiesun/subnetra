@@ -209,15 +209,32 @@ Because XOR masking is symmetric, a receiver reverses it by recomputing the same
 `pad` from the (cleartext) `tag` and the link key.
 
 **Selection under obfuscation.** The `key_id` selector (§5 step 1) is itself
-masked, so a receiver cannot read it directly. Instead it **trials** each
-configured peer's receive link key: it recomputes `pad`, de-masks the header, and
+masked, so a receiver cannot read it directly. Instead it **trials** a candidate
+peer's receive link key: it recomputes `pad`, de-masks the header, and
 accepts the candidate when the recovered header is self-consistent
 (`version == 1` **and** the embedded `key_id` equals that peer's id). A wrong key
 yields effectively random bytes that clear both checks with probability `< 2⁻²⁴`,
 so the trial resolves the real sender; the AEAD authentication of §5 step 4
 remains the actual security gate, so a (vanishingly rare) false pre-filter match
 simply fails there and the datagram is dropped. A spoke trials one key (its hub);
-a hub trials up to its peer count.
+a hub resolves the candidate as follows (issue #174 — a naive full scan per
+datagram would let an off-path attacker amplify one cheap junk datagram into
+`MAX_PEERS` keyed hashes on the single-threaded data plane):
+
+1. **Source-endpoint fast path.** The peer whose *current* (learned, §5 roaming)
+   endpoint equals the datagram's outer UDP source is trialed first — address
+   comparisons plus **one** keyed hash. All steady-state traffic, including from
+   previously-roamed peers, resolves here in O(1).
+2. **Metered full scan.** Only a datagram from an unknown source endpoint (a
+   genuinely roamed/restarted peer, or junk with a spoofed source) falls back to
+   trialing every configured peer's key, and each ingress drain performs at most
+   a fixed budget of such scans (`OBFS_SCAN_BUDGET`, 8 per drain). A datagram
+   needing a scan after the budget is spent is dropped for that drain
+   (`drop_udp_scan_budget` counter); a real roaming peer simply retries — its
+   next datagram or keepalive wins a scan slot, authenticates, and its new
+   endpoint is learned back onto the fast path. This bounds the worst-case
+   unauthenticated CPU at `8 × MAX_PEERS` keyed hashes per drain regardless of
+   flood rate, while junk beyond the budget costs only address comparisons.
 
 **Properties and limits.**
 
@@ -276,9 +293,11 @@ datagram, so the uniqueness invariant above applies unchanged.
 On a received UDP datagram from source endpoint `S`:
 
 > **If header obfuscation (§3.4) is enabled**, the header is masked on the wire,
-> so step 1 cannot read `key_id` directly. The receiver instead trials each
-> peer's receive link key to de-mask the header (§3.4) and proceeds with the
-> recovered cleartext header from step 2 onward. Steps 2–9 are unchanged.
+> so step 1 cannot read `key_id` directly. The receiver instead trial-de-masks
+> the header against candidate peers' receive link keys — source-endpoint fast
+> path first, then a budget-metered full scan (§3.4, "Selection under
+> obfuscation") — and proceeds with the recovered cleartext header from step 2
+> onward. Steps 2–9 are unchanged.
 
 1. **Identity selection (by `key_id`, not by endpoint).** Read `key_id` from the
    header and look up the peer `P` whose mesh id equals it. If no peer matches,

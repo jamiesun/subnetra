@@ -77,6 +77,21 @@ pub const WIRE_VERSION: u8 = 1;
 /// reserved (must be zero); a datagram setting one is dropped by `decodeIngress`.
 pub const FLAG_KEEPALIVE: u8 = 0b0000_0001;
 
+/// Full-registry trial-scan budget per UDP drain when header obfuscation is on
+/// (issue #174). The source-endpoint fast path resolves every steady-state
+/// datagram with ONE keyed hash; only a datagram from an UNKNOWN source endpoint
+/// (a genuinely roamed/restarted peer — or off-path junk with a spoofed source)
+/// falls back to trialing every configured peer's rx link key. This budget caps
+/// those fallback scans per `pumpUdpIngress` drain, bounding the worst-case
+/// unauthenticated CPU amplification at `OBFS_SCAN_BUDGET * MAX_PEERS` keyed
+/// hashes per drain instead of `packets * MAX_PEERS`. It refills every drain, so
+/// a roaming peer locked out by a concurrent flood is only deferred one tick: its
+/// next datagram (or keepalive) retries, wins a scan slot, authenticates, and its
+/// new endpoint is learned back onto the O(1) fast path. Eight slots per drain
+/// lets even a full 128-peer mesh re-home after a hub restart within a handful of
+/// keepalive-driven drains while keeping the flood ceiling small.
+pub const OBFS_SCAN_BUDGET: u32 = 8;
+
 /// Egress flow-control mode. New modes add a branch here and in `egress`.
 pub const EgressMode = enum {
     raw_direct, // v1: skip retransmission, MTU 1452
@@ -338,6 +353,16 @@ pub const Reactor = struct {
     /// defaults ON (stealth by default). This mechanism field is inert until
     /// wired, so a node with it off emits/accepts byte-identical v1 datagrams.
     obfuscate: bool = false,
+    /// Remaining full-registry trial scans this UDP drain (issue #174). With
+    /// obfuscation on, an inbound datagram whose SOURCE endpoint matches no
+    /// peer's current endpoint must trial every configured peer's rx link key
+    /// (one keyed-Blake2b each) before it can be dropped — an off-path attacker
+    /// spoofing arbitrary sources can amplify one cheap junk datagram into
+    /// O(MAX_PEERS) keyed hashes on this single-threaded reactor. This budget
+    /// caps how many such full scans one `pumpUdpIngress` drain will perform;
+    /// it refills at the top of every drain (see `OBFS_SCAN_BUDGET`), so the
+    /// steady state is unaffected and only a flood hits the ceiling.
+    obfs_scan_budget: u32 = OBFS_SCAN_BUDGET,
     rx: [BUF_LEN]u8 = undefined,
     tx: [BUF_LEN]u8 = undefined,
     /// Batched UDP datagram I/O (issue #100). Inbound datagrams are drained in
@@ -563,6 +588,11 @@ pub const Reactor = struct {
     /// forwards produced during the drain are coalesced and flushed with one
     /// `sendmmsg`. Loops until the socket is drained (recvmmsg would block).
     pub fn pumpUdpIngress(self: *Reactor, fd: sys.fd_t, fd_index: usize) void {
+        // Refill the obfuscation full-scan budget (issue #174): each drain may
+        // spend at most OBFS_SCAN_BUDGET full-registry key trials on datagrams
+        // whose source endpoint matches no peer, capping the unauthenticated CPU
+        // an off-path spoofed-source flood can extract from this single thread.
+        self.obfs_scan_budget = OBFS_SCAN_BUDGET;
         while (true) {
             const got = self.udp.recv(fd);
             if (got == 0) break; // EAGAIN / drained -> done this tick
@@ -579,21 +609,46 @@ pub const Reactor = struct {
 
     /// Resolve the sender peer for an inbound datagram. With obfuscation off this
     /// is the cheap O(1) header read: the cleartext `key_id` selects the peer.
-    /// With obfuscation on the selector is masked, so this trials each configured
-    /// peer's receive link key via `tryDeobfuscate`; the real sender's key
-    /// reproduces the pad, recovering a self-consistent header, which is then
-    /// de-masked IN PLACE so the shared decode path downstream sees a cleartext
-    /// header. Returns null and bumps the matching drop counter when the datagram
-    /// is too short or no configured peer claims it.
-    fn selectIngressPeer(self: *Reactor, dgram: []u8) ?*peer.Peer {
+    /// With obfuscation on the selector is masked, so selection is a trial
+    /// de-mask (`tryDeobfuscate`, one keyed hash per candidate): the real
+    /// sender's key reproduces the pad, recovering a self-consistent header,
+    /// which is then de-masked IN PLACE so the shared decode path downstream sees
+    /// a cleartext header. To keep that trial from being an O(peers) scan per
+    /// datagram (issue #174 — off-path junk would amplify into MAX_PEERS keyed
+    /// hashes each), the peer whose CURRENT endpoint matches the datagram's
+    /// source (`src`) is tried first: steady-state traffic — including a
+    /// previously-roamed peer, whose learned endpoint is what `findByAddr`
+    /// matches — resolves with ONE keyed hash. Only a datagram from an unknown
+    /// source endpoint falls back to the full scan, and those scans are metered
+    /// by `obfs_scan_budget` per drain; a datagram that needs a scan after the
+    /// budget is spent is dropped for this drain (`drop_udp_scan_budget`) — a
+    /// real roaming peer simply retries next drain, junk stays cheap forever.
+    /// Returns null and bumps the matching drop counter when the datagram is too
+    /// short or no configured peer claims it.
+    fn selectIngressPeer(self: *Reactor, dgram: []u8, src: sys.sockaddr.in) ?*peer.Peer {
         if (self.obfuscate) {
             if (dgram.len < HEADER_LEN + crypto.TAG_LEN) {
                 self.cInc("drop_udp_auth_or_invalid"); // too short to hold an obfuscated header + tag
                 return null;
             }
+            // Fast path: the peer we last heard from this endpoint (address
+            // comparisons only — no crypto). Its key either claims the datagram
+            // (one keyed hash, the steady state) or the datagram is not from the
+            // peer it appears to be from and must survive the metered full scan
+            // below like any other unknown-source datagram.
+            const hint = self.registry.findByAddr(src.addr, src.port);
+            if (hint) |p| {
+                if (tryDeobfuscate(p.rx.link_key, p.id, dgram)) return p;
+            }
+            if (self.obfs_scan_budget == 0) {
+                self.cInc("drop_udp_scan_budget"); // scan budget spent this drain
+                return null;
+            }
+            self.obfs_scan_budget -= 1;
             var i: usize = 0;
             while (i < self.registry.len) : (i += 1) {
                 const p = &self.registry.peers[i];
+                if (hint == p) continue; // already tried on the fast path
                 if (tryDeobfuscate(p.rx.link_key, p.id, dgram)) return p;
             }
             self.cInc("drop_udp_unknown_peer"); // no peer's link key recovers a valid header
@@ -621,8 +676,9 @@ pub const Reactor = struct {
         // endpoint. This selection is only a HINT until the datagram
         // authenticates below; a wrong/forged key_id fails authentication. When
         // header obfuscation is on, the selector is masked, so `selectIngressPeer`
-        // trial-de-masks the header in place first (see below).
-        const src_peer = self.selectIngressPeer(dgram) orelse return; // drop counter bumped inside
+        // trial-de-masks the header in place first — source-endpoint fast path,
+        // then a budget-metered full scan (issue #174; see below).
+        const src_peer = self.selectIngressPeer(dgram, src) orelse return; // drop counter bumped inside
 
         const plen = decodeIngress(&src_peer.rx, dgram, &self.tx) orelse {
             self.cInc("drop_udp_auth_or_invalid");
@@ -1271,6 +1327,107 @@ test "pump: obfuscated ingress trial-selects the sender, de-masks, and delivers 
     r.pumpUdpIngress(r.udp_fds[0], 0);
     try std.testing.expect(sys.errno(sys.read(pipe_fds[0], &buf, buf.len)) == .AGAIN);
     try std.testing.expectEqual(@as(u64, 1), ctr.drop_udp_auth_or_invalid);
+}
+
+test "pump: obfuscated ingress fast path is O(1), roaming pays one scan, junk is budget-capped (issue #174)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const psk: crypto.Key = [_]u8{0x35} ** crypto.KEY_LEN;
+
+    const pipe_fds = sys.pipeNonblock() catch return error.SkipZigTest;
+    defer _ = sys.close(pipe_fds[0]);
+    defer _ = sys.close(pipe_fds[1]);
+
+    const udp_hub = try makeUdpLoopback(); // reactor's udp_fd (local id 1)
+    defer _ = sys.close(udp_hub);
+    const udp_a = try makeUdpLoopback(); // spoke A (id 2), at its REGISTERED endpoint
+    defer _ = sys.close(udp_a);
+    const udp_roam = try makeUdpLoopback(); // spoke A again, from an UNKNOWN endpoint (roamed)
+    defer _ = sys.close(udp_roam);
+    const udp_junk = try makeUdpLoopback(); // off-path junk source (never registered)
+    defer _ = sys.close(udp_junk);
+
+    const hub_addr = try addrOf(udp_hub);
+
+    var reg = peer.PeerRegistry.init(1);
+    _ = try reg.add(psk, 2, try addrOf(udp_a), try policy.parseCidr("10.0.0.2/32"), TEST_EPOCH);
+    _ = try reg.add(psk, 3, fakeAddr(40003), try policy.parseCidr("10.0.0.3/32"), TEST_EPOCH);
+
+    const entries = [_]policy.PolicyEntry{.{
+        .src = try policy.parseCidr("0.0.0.0/0"),
+        .dst = try policy.parseCidr("10.0.0.1/32"),
+        .action = .forward,
+        .target = peer.LOCAL_TARGET,
+    }};
+    var tree = policy.PolicyTree{ .entries = &entries };
+    var active = policy.ActiveTree.init(&tree);
+
+    var r = Reactor.init(pipe_fds[1], udp_hub, null, &active, &reg);
+    var ctr = stats.Counters{};
+    r.counters = &ctr;
+    r.obfuscate = true;
+
+    const a_tx_key = crypto.deriveLinkKey(psk, 2, 1); // spoke A -> hub direction
+    var a_tx = crypto.TxSession.init(a_tx_key, TEST_EPOCH);
+    const legit = ipPkt(.{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 });
+    var wire: [MAX_WIRE]u8 = undefined;
+    var buf: [MAX_PLAINTEXT]u8 = undefined;
+
+    // 1. Steady state: A sends from its registered endpoint. The source-endpoint
+    //    fast path resolves it with ONE keyed trial — the full-scan budget is
+    //    untouched and the packet is delivered.
+    var wl = encodeEgress(&a_tx, 2, &legit, &wire);
+    obfuscateHeader(a_tx_key, wire[0..wl]);
+    _ = sys.sendto(udp_a, &wire, wl, 0, @ptrCast(@constCast(&hub_addr)), @sizeOf(sys.sockaddr.in));
+    r.pumpUdpIngress(r.udp_fds[0], 0);
+    try std.testing.expect(sys.errno(sys.read(pipe_fds[0], &buf, buf.len)) == .SUCCESS);
+    try std.testing.expectEqual(OBFS_SCAN_BUDGET, r.obfs_scan_budget); // no scan slot spent
+
+    // 2. Roaming: A sends from an endpoint no peer currently owns. The fast path
+    //    misses, ONE budgeted full scan resolves it, the packet is delivered, and
+    //    the new endpoint is learned back onto the fast path.
+    wl = encodeEgress(&a_tx, 2, &legit, &wire);
+    obfuscateHeader(a_tx_key, wire[0..wl]);
+    _ = sys.sendto(udp_roam, &wire, wl, 0, @ptrCast(@constCast(&hub_addr)), @sizeOf(sys.sockaddr.in));
+    r.pumpUdpIngress(r.udp_fds[0], 0);
+    try std.testing.expect(sys.errno(sys.read(pipe_fds[0], &buf, buf.len)) == .SUCCESS);
+    try std.testing.expectEqual(OBFS_SCAN_BUDGET - 1, r.obfs_scan_budget); // exactly one scan slot spent
+    try std.testing.expect(sameEndpoint(reg.findById(2).?.endpoint, try addrOf(udp_roam)));
+
+    // 3. Post-roam steady state: the next datagram from the roamed endpoint rides
+    //    the fast path again (the drain-refilled budget stays full).
+    wl = encodeEgress(&a_tx, 2, &legit, &wire);
+    obfuscateHeader(a_tx_key, wire[0..wl]);
+    _ = sys.sendto(udp_roam, &wire, wl, 0, @ptrCast(@constCast(&hub_addr)), @sizeOf(sys.sockaddr.in));
+    r.pumpUdpIngress(r.udp_fds[0], 0);
+    try std.testing.expect(sys.errno(sys.read(pipe_fds[0], &buf, buf.len)) == .SUCCESS);
+    try std.testing.expectEqual(OBFS_SCAN_BUDGET, r.obfs_scan_budget);
+
+    // 4. Off-path flood: unknown-source junk that no peer's key claims. One drain
+    //    performs at most OBFS_SCAN_BUDGET full scans (each dropped unknown_peer);
+    //    everything past the budget is dropped WITHOUT any keyed trials
+    //    (drop_udp_scan_budget) — the amplification is capped per drain.
+    var junk: [HEADER_LEN + crypto.TAG_LEN]u8 = undefined;
+    for (&junk, 0..) |*b, i| b.* = @intCast((i *% 131 +% 7) & 0xff);
+    const extra = 3;
+    var n: usize = 0;
+    while (n < OBFS_SCAN_BUDGET + extra) : (n += 1) {
+        _ = sys.sendto(udp_junk, &junk, junk.len, 0, @ptrCast(@constCast(&hub_addr)), @sizeOf(sys.sockaddr.in));
+    }
+    r.pumpUdpIngress(r.udp_fds[0], 0);
+    try std.testing.expect(sys.errno(sys.read(pipe_fds[0], &buf, buf.len)) == .AGAIN);
+    try std.testing.expectEqual(@as(u64, OBFS_SCAN_BUDGET), ctr.drop_udp_unknown_peer);
+    try std.testing.expectEqual(@as(u64, extra), ctr.drop_udp_scan_budget);
+    try std.testing.expectEqual(@as(u32, 0), r.obfs_scan_budget);
+
+    // 5. The budget refills next drain: A (still at the roamed endpoint) is not
+    //    locked out by the earlier flood — it delivers via the fast path anyway.
+    wl = encodeEgress(&a_tx, 2, &legit, &wire);
+    obfuscateHeader(a_tx_key, wire[0..wl]);
+    _ = sys.sendto(udp_roam, &wire, wl, 0, @ptrCast(@constCast(&hub_addr)), @sizeOf(sys.sockaddr.in));
+    r.pumpUdpIngress(r.udp_fds[0], 0);
+    try std.testing.expect(sys.errno(sys.read(pipe_fds[0], &buf, buf.len)) == .SUCCESS);
+    try std.testing.expectEqual(OBFS_SCAN_BUDGET, r.obfs_scan_budget);
 }
 
 test "pump: relay A -> hub -> B routes by policy target, no-reflect holds" {
