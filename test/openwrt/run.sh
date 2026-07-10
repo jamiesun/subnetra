@@ -132,7 +132,7 @@ spawn qemu-system-x86_64 \
 expect {
 	"Please press Enter to activate this console." {}
 	"procd: - init complete -" {}
-	timeout { puts "\n[owrt] boot timeout"; exit 2 }
+	timeout { puts "\n\[owrt\] boot timeout"; exit 2 }
 }
 
 # OpenWrt's serial console is askfirst: press Enter to spawn the passwordless
@@ -153,24 +153,24 @@ for {set i 0} {$i < 8} {incr i} {
 	if {$got_prompt} break
 	sleep 2
 }
-if {!$got_prompt} { puts "\n[owrt] prompt timeout"; exit 2 }
+if {!$got_prompt} { puts "\n\[owrt\] prompt timeout"; exit 2 }
 set timeout 60
 
 # bring up qemu user-net connectivity deterministically (no reliance on default
 # OpenWrt LAN config): add the DHCP-pool address + default route + DNS forwarder.
 send "NETDEV=br-lan; ip link show br-lan >/dev/null 2>&1 || NETDEV=\$(ip -o link | awk -F': ' '/ether/{print \$2; exit}'); ip address add 10.0.2.15/24 dev \$NETDEV; ip route add default via 10.0.2.2; printf 'nameserver 10.0.2.3\\n' > /etc/resolv.conf; echo NETUP_DONE\r"
 expect {
-	"NETUP_DONE" {}
-	timeout { puts "\n[owrt] net-setup timeout"; exit 2 }
+	-re {[\r\n]NETUP_DONE[\r\n]} {}
+	timeout { puts "\n\[owrt\] net-setup timeout"; exit 2 }
 }
 expect -re $prompt
 
 # confirm the host HTTP server is reachable before handing off to the smoke
 send "uclient-fetch -q -O /tmp/guest-smoke.sh http://10.0.2.2:$httpport/guest-smoke.sh && echo FETCH_OK || echo FETCH_FAIL\r"
 expect {
-	"FETCH_OK"   {}
-	"FETCH_FAIL" { puts "\n[owrt] cannot reach host HTTP server"; exit 3 }
-	timeout      { puts "\n[owrt] fetch timeout"; exit 3 }
+	-re {[\r\n]FETCH_OK[\r\n]}   {}
+	-re {[\r\n]FETCH_FAIL[\r\n]} { puts "\n\[owrt\] cannot reach host HTTP server"; exit 3 }
+	timeout      { puts "\n\[owrt\] fetch timeout"; exit 3 }
 }
 expect -re $prompt
 
@@ -180,7 +180,7 @@ send "HTTP_PORT=$httpport sh /tmp/guest-smoke.sh\r"
 set rc 99
 expect {
 	-re {SMOKE_RESULT=([0-9]+)} { set rc $expect_out(1,string) }
-	timeout { puts "\n[owrt] smoke timeout"; exit 3 }
+	timeout { puts "\n\[owrt\] smoke timeout"; exit 3 }
 }
 
 expect -re $prompt
