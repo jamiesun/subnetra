@@ -172,6 +172,7 @@ pub fn parseCommand(line: []const u8) ParseError!Command {
     };
     var have_src = false;
     var have_dst = false;
+    var have_target = false;
 
     while (it.next()) |flag| {
         if (std.mem.eql(u8, flag, "--src")) {
@@ -190,12 +191,17 @@ pub fn parseCommand(line: []const u8) ParseError!Command {
                 return ParseError.InvalidValue;
         } else if (std.mem.eql(u8, flag, "--target")) {
             entry.target = std.fmt.parseInt(u32, try nextValue(&it), 10) catch return ParseError.InvalidValue;
+            have_target = true;
         } else {
             return ParseError.UnknownCommand;
         }
     }
 
     if (!have_src or !have_dst) return ParseError.MissingArgument;
+    // `--target` is required for `forward` (docs/CONTROL-PROTOCOL.md §3.1).
+    // Without this check a missing target would default to 0 == LOCAL_TARGET
+    // and silently install a local-delivery rule instead of a forward rule.
+    if (entry.action == .forward and !have_target) return ParseError.MissingArgument;
     return .{ .policy_add = entry };
 }
 
@@ -827,6 +833,11 @@ test "parseCommand: show / save / status / errors" {
     try std.testing.expectError(ParseError.UnknownCommand, parseCommand("status --bogus"));
     try std.testing.expectError(ParseError.UnknownCommand, parseCommand("bogus"));
     try std.testing.expectError(ParseError.MissingArgument, parseCommand("policy add --src 10.0.0.0/24"));
+    // `--target` is required for forward (docs/CONTROL-PROTOCOL.md §3.1); a
+    // missing target must not silently become target=0 (local delivery).
+    try std.testing.expectError(ParseError.MissingArgument, parseCommand("policy add --src 10.0.0.0/24 --dst 10.0.1.0/24 --action forward"));
+    // `drop` does not need a target.
+    try std.testing.expect(try parseCommand("policy add --src 10.0.0.0/24 --dst 10.0.1.0/24 --action drop") == .policy_add);
 }
 
 test "formatStatus: renders meta, peers, and counters; never prints secrets" {
